@@ -43,10 +43,11 @@ function RenameDevice {
     }
 
     # Get device ID from Graph API using OriginalDeviceName
-    $uri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices?`$filter=deviceName eq '$OriginalDeviceName'"
+    $uri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices" + "?`$filter=deviceName eq '$OriginalDeviceName'"
     $headers = @{
         Authorization = "Bearer $AccessToken"
         Accept        = "application/json"
+        "Content-Type" = "application/json"
     }
     $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
     if (!$response.value -or $response.value.Count -eq 0) {
@@ -59,7 +60,51 @@ function RenameDevice {
     $body = @{
         "deviceName" = $NewName
     } | ConvertTo-Json
-    Invoke-RestMethod -Uri $renameUri -Headers $headers -Method Post -Body $body
+    
+    try {
+        $response = $null
+        try {
+            $response = Invoke-RestMethod -Uri $renameUri -Headers $headers -Method Post -Body $body -ErrorAction Stop -Verbose:$false
+            # If successful, try to get status code from the response headers (not always available)
+            if ($LASTEXITCODE -eq 0 -or $?) {
+                Write-Host "Rename response: HTTP 200 OK"
+            } else {
+                Write-Host "Rename response: HTTP status unknown (Invoke-RestMethod does not expose status code on success)"
+            }
+            if ($response) {
+                Write-Host "Response body: $($response | ConvertTo-Json -Compress)"
+            }
+        } catch {
+            if ($_.Exception.Response) {
+                $statusCode = $_.Exception.Response.StatusCode.value__
+                $statusDesc = $_.Exception.Response.ReasonPhrase
+                Write-Error "Failed to rename device: HTTP $statusCode $statusDesc"
+                
+                # Try to get response body
+                $responseBody = ""
+                try {
+                    if ($_.Exception.Response.Content) {
+                        $responseBody = $_.Exception.Response.Content.ReadAsStringAsync().Result
+                    }
+                } catch {
+                    try {
+                        $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                        $responseBody = $reader.ReadToEnd()
+                    } catch {}
+                }
+                
+                if ($responseBody) {
+                    Write-Error "Response body: $responseBody"
+                }
+            } else {
+                Write-Error "Failed to rename device: $($_.Exception.Message)"
+            }
+            throw
+        }
+    } catch {
+        Write-Error "Unexpected error: $($_.Exception.Message)"
+        throw
+    }
 
     # Reboot device using Graph API
     $rebootUri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$deviceId/rebootNow"
@@ -77,6 +122,7 @@ function Get-AccessTokenWithCertificate {
         [string]$Resource = "https://graph.microsoft.com/.default"
     )
     
+    
     # Base64URL encode function
     function ConvertTo-Base64Url($text) {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
@@ -87,6 +133,9 @@ function Get-AccessTokenWithCertificate {
     try {
         # Step 1: Interactive Azure login
         Write-Host "Please sign in to Azure..." -ForegroundColor Yellow
+        # Clear any existing context that might have subscription issues
+        $null = Clear-AzContext -Force -ErrorAction SilentlyContinue
+        # Connect to Azure for the specific tenant only, let user choose subscription
         $azContext = Connect-AzAccount -TenantId $TenantId -ErrorAction Stop
         Write-Host "Successfully connected to Azure as: $($azContext.Context.Account.Id)" -ForegroundColor Green
         
@@ -113,7 +162,7 @@ function Get-AccessTokenWithCertificate {
         Write-Host "Creating JWT client assertion..." -ForegroundColor Yellow
         
         $now = [System.DateTimeOffset]::UtcNow
-        $exp = $now.AddMinutes(10).ToUnixTimeSeconds()
+        $exp = $now.AddMinutes(120).ToUnixTimeSeconds()
         $nbf = $now.ToUnixTimeSeconds()
         $aud = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
         
@@ -199,7 +248,7 @@ function Get-DevicePrimaryUserCountryCode {
     )
 
     # Get device info from Graph API
-    $deviceUri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices?`$filter=deviceName eq '$OriginalDeviceName'"
+    $deviceUri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices" + "?`$filter=deviceName eq '$OriginalDeviceName'"
     $headers = @{
         Authorization = "Bearer $AccessToken"
         Accept        = "application/json"
@@ -214,10 +263,14 @@ function Get-DevicePrimaryUserCountryCode {
     }
 
     # Get user info from Graph API
-     $userUri = "https://graph.microsoft.com/v1.0/users/$userId?`$select=usageLocation"
-        # Test the code. 
-        # $userUri = "https://graph.microsoft.com/v1.0/users/a31381bd-85ec-44bf-bd4f-c7e1d0e33b59"
-    $userResponse = Invoke-RestMethod -Uri $userUri -Headers $headers -Method Get
+    $userUri = "https://graph.microsoft.com/v1.0/users/$userId" + '?$select=usageLocation'
+    # Test the code. 
+    # $userUri = "https://graph.microsoft.com/v1.0/users/a31381bd-85ec-44bf-bd4f-c7e1d0e33b59"
+    try {
+        $userResponse = Invoke-RestMethod -Uri $userUri -Headers $headers -Method Get
+    } catch {
+        throw "Failed to get user info for user '$userId': $_"
+    }
     $country = $userResponse.usageLocation
     if (-not $country) {
         throw "Usage Location property not found for user '$userId'."
@@ -258,7 +311,14 @@ $groupResponse = Invoke-RestMethod -Uri $groupUri -Headers $headers -Method Get
 
 foreach ($member in $groupResponse.value) {
     if ($member.'@odata.type' -eq "#microsoft.graph.device") {
-        $OriginalDeviceName = $member.displayName
+        # Get device object ID from group member
+        $DeviceId = $member.id
+
+        # Query Graph API for device details to get displayName
+        $deviceDetailUri = "https://graph.microsoft.com/v1.0/devices/$DeviceId"
+        $deviceDetail = Invoke-RestMethod -Uri $deviceDetailUri -Headers $headers -Method Get
+
+        $OriginalDeviceName = $deviceDetail.displayName
 
         try {
             $CountryCode = Get-DevicePrimaryUserCountryCode -OriginalDeviceName $OriginalDeviceName -AccessToken $AccessToken
