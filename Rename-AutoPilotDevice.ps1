@@ -1,116 +1,228 @@
-# Install-Module -Name Az.KeyVault -Force -AllowClobber
-# Install-Module -Name Az.KeyVault -Force -AllowClobber
+<#
+.SYNOPSIS
+    Renames AutoPilot devices based on primary user's country location.
+
+.DESCRIPTION
+    This script authenticates to Microsoft Graph using certificate-based authentication,
+    retrieves devices from a specified Entra ID group, determines each device's primary
+    user's country, and renames the device with a country-specific prefix (CMA{CountryCode}-).
+
+.PARAMETER TenantId
+    Azure AD Tenant ID (default: hardcoded value)
+
+.PARAMETER ClientId
+    Application (Client) ID of the registered Azure AD app (default: hardcoded value)
+
+.PARAMETER KeyVaultName
+    Name of the Azure Key Vault containing the authentication certificate (default: hardcoded value)
+
+.PARAMETER CertificateName
+    Name of the certificate in Key Vault (default: hardcoded value)
+
+.PARAMETER GroupId
+    Object ID of the Entra ID group containing devices to rename (default: hardcoded value)
+
+.EXAMPLE
+    .\Rename-AutoPilotDevice.ps1
+    Runs the script with default configuration values
+
+.NOTES
+    Author: AutoPilot Management Team
+    Requires: PowerShell 5.1+, Az.KeyVault, Az.Accounts modules
+    Required Graph API permissions:
+    - DeviceManagementManagedDevices.Read.All
+    - DeviceManagementManagedDevices.PrivilegedOperations.All
+    - Device.ReadWrite.All
+    - Group.Read.All
+    - GroupMember.Read.All
+    - User.Read.All
+#>
+
+[CmdletBinding()]
+param(
+    [string]$TenantId = "55f37ed7-ebe7-4cea-8686-1ca9653384f1",
+    [string]$ClientId = "da0eded7-8e16-4a2e-b259-ebbf9396d62a",
+    [string]$KeyVaultName = "moonappcert",
+    [string]$CertificateName = "RenameAutoPilotDeviceCert",
+    [string]$GroupId = "69e3150d-cf9f-4847-9743-e00c5347929e"
+)
+
+#Requires -Modules Az.KeyVault, Az.Accounts
+
 Import-Module Az.KeyVault, Az.Accounts
 
-function NewDeviceName {
+# Configuration constants
+$Script:Config = @{
+    DeviceNamePrefix = "CMA"
+    MaxDeviceNameLength = 15
+    GraphBaseUri = "https://graph.microsoft.com"
+}
+
+function New-DeviceName {
+    <#
+    .SYNOPSIS
+        Generates a new device name based on country code.
+    .DESCRIPTION
+        Creates device names in format: CMA{CountryCode}-{OriginalSuffix}
+        Ensures the name doesn't exceed the maximum length limit.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
     param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [string]$OriginalDeviceName,
+        
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[A-Z]{2}$')]
         [string]$CountryCode
     )
 
-    # Validate country code format (ISO 3166-1 alpha-2)
-    if ($CountryCode -notmatch '^[A-Z]{2}$') {
-        throw "Country code must be 2 uppercase letters (ISO 3166-1 alpha-2)."
+    Write-Verbose "Generating new device name for '$OriginalDeviceName' with country code '$CountryCode'"
+
+    # Check if device name already contains country code in expected format
+    $expectedPrefix = "$($Script:Config.DeviceNamePrefix)$CountryCode-"
+    if ($OriginalDeviceName -match "^$expectedPrefix") {
+        Write-Verbose "Device '$OriginalDeviceName' already has correct country prefix"
+        return $OriginalDeviceName
     }
 
-    # Check if device name already contains country code in "CMAXX-" format
-    if ($OriginalDeviceName -match "^CMA$CountryCode-") {
-        $NewName = $OriginalDeviceName
+    # Extract the suffix from original name (everything after the first 3 characters)
+    if ($OriginalDeviceName.Length -gt 3) {
+        $suffix = $OriginalDeviceName.Substring(3)
     } else {
-        # Get the right part of the device name starting from the 4th character (index 3)
-        $RightPart = $OriginalDeviceName.Substring(3)
-        $NewName = "CMA$CountryCode-$RightPart"
+        $suffix = $OriginalDeviceName
+    }
+    
+    $newName = "$expectedPrefix$suffix"
+
+    # Trim to maximum length if necessary
+    if ($newName.Length -gt $Script:Config.MaxDeviceNameLength) {
+        $newName = $newName.Substring(0, $Script:Config.MaxDeviceNameLength)
+        Write-Warning "Device name truncated to $($Script:Config.MaxDeviceNameLength) characters: $newName"
     }
 
-    # Trim to 15 characters if longer
-    if ($NewName.Length -gt 15) {
-        $NewName = $NewName.Substring(0, 15)
-    }
-
-    return $NewName
+    Write-Verbose "Generated new device name: '$newName'"
+    return $newName
 }
 
-function RenameDevice {
+function Rename-Device {
+    <#
+    .SYNOPSIS
+        Renames a managed device using Microsoft Graph API.
+    .DESCRIPTION
+        Finds the device by name in Intune, renames it, and initiates a reboot.
+    #>
+    [CmdletBinding()]
     param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [string]$OriginalDeviceName,
+        
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [string]$NewName,
+        
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [string]$AccessToken
     )
 
     if ($OriginalDeviceName -eq $NewName) {
-        Write-Host "Device '$OriginalDeviceName' already has the desired name '$NewName'. No rename needed."
+        Write-Host "Device '$OriginalDeviceName' already has the desired name. No rename needed." -ForegroundColor Green
         return
     }
 
-    # Get device ID from Graph API using OriginalDeviceName
-    $uri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices" + "?`$filter=deviceName eq '$OriginalDeviceName'"
+    Write-Verbose "Starting rename process for device '$OriginalDeviceName' to '$NewName'"
+
+    try {
+        # Get device ID from Graph API using device name
+        $deviceId = Get-IntuneDeviceId -DeviceName $OriginalDeviceName -AccessToken $AccessToken
+        
+        # Rename device using Graph API
+        $renameUri = "$($Script:Config.GraphBaseUri)/beta/deviceManagement/managedDevices/$deviceId/setDeviceName"
+        $headers = @{
+            Authorization = "Bearer $AccessToken"
+            Accept        = "application/json"
+            "Content-Type" = "application/json"
+        }
+        $body = @{ deviceName = $NewName } | ConvertTo-Json
+        
+        Write-Verbose "Sending rename request to: $renameUri"
+        $response = Invoke-RestMethod -Uri $renameUri -Headers $headers -Method Post -Body $body -ErrorAction Stop
+        Write-Host "Successfully renamed device '$OriginalDeviceName' to '$NewName'" -ForegroundColor Green
+        
+        # Reboot device using Graph API
+        $rebootUri = "$($Script:Config.GraphBaseUri)/beta/deviceManagement/managedDevices/$deviceId/rebootNow"
+        Write-Verbose "Initiating reboot for device: $rebootUri"
+        Invoke-RestMethod -Uri $rebootUri -Headers $headers -Method Post -ErrorAction Stop
+        Write-Host "Reboot initiated for device '$NewName'" -ForegroundColor Yellow
+    }
+    catch {
+        $errorMessage = "Failed to rename device '$OriginalDeviceName': $($_.Exception.Message)"
+        
+        # Enhanced error handling for HTTP responses
+        if ($_.Exception.Response) {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            $statusDesc = $_.Exception.Response.ReasonPhrase
+            $errorMessage += " (HTTP $statusCode $statusDesc)"
+            
+            # Try to get response body for more details
+            try {
+                if ($_.Exception.Response.Content) {
+                    $responseBody = $_.Exception.Response.Content.ReadAsStringAsync().Result
+                    if ($responseBody) {
+                        $errorMessage += " - Response: $responseBody"
+                    }
+                }
+            }
+            catch {
+                # Ignore errors reading response body
+            }
+        }
+        
+        Write-Error $errorMessage
+        throw
+    }
+}
+
+function Get-IntuneDeviceId {
+    <#
+    .SYNOPSIS
+        Gets the Intune device ID for a device by name.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DeviceName,
+        
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$AccessToken
+    )
+
+    $uri = "$($Script:Config.GraphBaseUri)/beta/deviceManagement/managedDevices" + "?`$filter=deviceName eq '$DeviceName'"
     $headers = @{
         Authorization = "Bearer $AccessToken"
         Accept        = "application/json"
-        "Content-Type" = "application/json"
     }
-    $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
-    if (!$response.value -or $response.value.Count -eq 0) {
-        throw "Device with name '$OriginalDeviceName' not found."
-    }
-    $deviceId = $response.value[0].id
-
-    # Rename device using Graph API
-    $renameUri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$deviceId/setDeviceName"
-    $body = @{
-        "deviceName" = $NewName
-    } | ConvertTo-Json
     
-    try {
-        $response = $null
-        try {
-            $response = Invoke-RestMethod -Uri $renameUri -Headers $headers -Method Post -Body $body -ErrorAction Stop -Verbose:$false
-            # If successful, try to get status code from the response headers (not always available)
-            if ($LASTEXITCODE -eq 0 -or $?) {
-                Write-Host "Rename response: HTTP 200 OK"
-            } else {
-                Write-Host "Rename response: HTTP status unknown (Invoke-RestMethod does not expose status code on success)"
-            }
-            if ($response) {
-                Write-Host "Response body: $($response | ConvertTo-Json -Compress)"
-            }
-        } catch {
-            if ($_.Exception.Response) {
-                $statusCode = $_.Exception.Response.StatusCode.value__
-                $statusDesc = $_.Exception.Response.ReasonPhrase
-                Write-Error "Failed to rename device: HTTP $statusCode $statusDesc"
-                
-                # Try to get response body
-                $responseBody = ""
-                try {
-                    if ($_.Exception.Response.Content) {
-                        $responseBody = $_.Exception.Response.Content.ReadAsStringAsync().Result
-                    }
-                } catch {
-                    try {
-                        $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-                        $responseBody = $reader.ReadToEnd()
-                    } catch {}
-                }
-                
-                if ($responseBody) {
-                    Write-Error "Response body: $responseBody"
-                }
-            } else {
-                Write-Error "Failed to rename device: $($_.Exception.Message)"
-            }
-            throw
-        }
-    } catch {
-        Write-Error "Unexpected error: $($_.Exception.Message)"
-        throw
+    Write-Verbose "Searching for device '$DeviceName' in Intune"
+    $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+    
+    if (-not $response.value -or $response.value.Count -eq 0) {
+        throw "Device with name '$DeviceName' not found in Intune"
     }
-
-    # Reboot device using Graph API
-    $rebootUri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$deviceId/rebootNow"
-    Invoke-RestMethod -Uri $rebootUri -Headers $headers -Method Post
-
-    Write-Host "Device '$OriginalDeviceName' renamed to '$NewName' and reboot initiated."
+    
+    if ($response.value.Count -gt 1) {
+        Write-Warning "Multiple devices found with name '$DeviceName'. Using the first one."
+    }
+    
+    $deviceId = $response.value[0].id
+    Write-Verbose "Found device ID: $deviceId"
+    return $deviceId
 }
 
 function Get-AccessTokenWithCertificate {
@@ -242,91 +354,165 @@ function Get-AccessTokenWithCertificate {
 }
 
 function Get-DevicePrimaryUserCountryCode {
+    <#
+    .SYNOPSIS
+        Gets the country code for a device's primary user.
+    .DESCRIPTION
+        Looks up the device in Intune, finds its primary user, and returns the user's usage location.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
     param (
-        [string]$OriginalDeviceName,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DeviceName,
+        
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [string]$AccessToken
     )
 
-    # Get device info from Graph API
-    $deviceUri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices" + "?`$filter=deviceName eq '$OriginalDeviceName'"
+    Write-Verbose "Getting country code for device '$DeviceName'"
+
+    try {
+        # Get device information including primary user
+        $deviceUri = "$($Script:Config.GraphBaseUri)/beta/deviceManagement/managedDevices" + "?`$filter=deviceName eq '$DeviceName'"
+        $headers = @{
+            Authorization = "Bearer $AccessToken"
+            Accept        = "application/json"
+        }
+        
+        $deviceResponse = Invoke-RestMethod -Uri $deviceUri -Headers $headers -Method Get -ErrorAction Stop
+        
+        if (-not $deviceResponse.value -or $deviceResponse.value.Count -eq 0) {
+            throw "Device with name '$DeviceName' not found in Intune"
+        }
+        
+        $userId = $deviceResponse.value[0].userId
+        if (-not $userId) {
+            throw "Primary user not found for device '$DeviceName'"
+        }
+
+        Write-Verbose "Found primary user ID: $userId"
+
+        # Get user's usage location
+        $userUri = "$($Script:Config.GraphBaseUri)/v1.0/users/$userId" + '?$select=usageLocation'
+        $userResponse = Invoke-RestMethod -Uri $userUri -Headers $headers -Method Get -ErrorAction Stop
+        
+        $countryCode = $userResponse.usageLocation
+        if (-not $countryCode) {
+            throw "Usage location not set for user '$userId' (primary user of device '$DeviceName')"
+        }
+
+        $countryCode = $countryCode.ToUpper()
+        Write-Verbose "Found country code '$countryCode' for device '$DeviceName'"
+        return $countryCode
+    }
+    catch {
+        Write-Error "Failed to get country code for device '$DeviceName': $($_.Exception.Message)"
+        throw
+    }
+}
+
+#region Main Script Execution
+
+# Validate parameters
+if ([string]::IsNullOrEmpty($GroupId) -or $GroupId -eq "<your-group-id>") {
+    Write-Error "Please provide a valid Group ID parameter."
+    Write-Host "You can find the Group ID in the Azure Portal or using Graph API." -ForegroundColor Yellow
+    Write-Host "Example: .\Rename-AutoPilotDevice.ps1 -GroupId '12345678-1234-1234-1234-123456789012'" -ForegroundColor Yellow
+    exit 1
+}
+
+try {
+    Write-Host "=== AutoPilot Device Rename Process Started ===" -ForegroundColor Cyan
+    Write-Host "Tenant ID: $TenantId" -ForegroundColor Gray
+    Write-Host "Group ID: $GroupId" -ForegroundColor Gray
+    Write-Host ""
+
+    # Get access token
+    $accessToken = Get-AccessTokenWithCertificate -TenantId $TenantId -ClientId $ClientId -KeyVaultName $KeyVaultName -CertificateName $CertificateName
+
+    # Get devices from Entra ID group
+    Write-Host "Getting devices from Entra ID group..." -ForegroundColor Yellow
+    $groupUri = "$($Script:Config.GraphBaseUri)/v1.0/groups/$GroupId/members"
     $headers = @{
-        Authorization = "Bearer $AccessToken"
+        Authorization = "Bearer $accessToken"
         Accept        = "application/json"
     }
-    $deviceResponse = Invoke-RestMethod -Uri $deviceUri -Headers $headers -Method Get
-    if (!$deviceResponse.value -or $deviceResponse.value.Count -eq 0) {
-        throw "Device with name '$OriginalDeviceName' not found."
-    }
-    $userId = $deviceResponse.value[0].userId
-    if (-not $userId) {
-        throw "Primary user not found for device '$OriginalDeviceName'."
-    }
+    $groupResponse = Invoke-RestMethod -Uri $groupUri -Headers $headers -Method Get -ErrorAction Stop
 
-    # Get user info from Graph API
-    $userUri = "https://graph.microsoft.com/v1.0/users/$userId" + '?$select=usageLocation'
-    # Test the code. 
-    # $userUri = "https://graph.microsoft.com/v1.0/users/a31381bd-85ec-44bf-bd4f-c7e1d0e33b59"
-    try {
-        $userResponse = Invoke-RestMethod -Uri $userUri -Headers $headers -Method Get
-    } catch {
-        throw "Failed to get user info for user '$userId': $_"
-    }
-    $country = $userResponse.usageLocation
-    if (-not $country) {
-        throw "Usage Location property not found for user '$userId'."
+    # Filter and process only device members
+    $devices = $groupResponse.value | Where-Object { $_.'@odata.type' -eq "#microsoft.graph.device" }
+    
+    if (-not $devices) {
+        Write-Warning "No devices found in the specified group."
+        exit 0
     }
 
-    # Return ISO country code (assume country property is ISO 3166-1 alpha-2)
-    return $country
-}
+    Write-Host "Found $($devices.Count) device(s) in the group" -ForegroundColor Green
+    Write-Host ""
 
-# Main script logic
-# Variables
-$TenantId       = "55f37ed7-ebe7-4cea-8686-1ca9653384f1"
-$ClientId       = "da0eded7-8e16-4a2e-b259-ebbf9396d62a"
-$KeyVaultName   = "moonappcert"
-$CertificateName= "RenameAutoPilotDeviceCert"
-$GroupId        = "69e3150d-cf9f-4847-9743-e00c5347929e"  # Set your actual group ID here
+    # Initialize counters
+    $deviceCount = 0
+    $successCount = 0
+    $failureCount = 0
+    $skippedCount = 0
 
-# Get access token
-$AccessToken = Get-AccessTokenWithCertificate -TenantId $TenantId -ClientId $ClientId -KeyVaultName $KeyVaultName -CertificateName $CertificateName
-
-# Check if GroupId is provided
-if ([string]::IsNullOrEmpty($GroupId) -or $GroupId -eq "<your-group-id>") {
-    Write-Host "Please provide a valid Group ID in the `$GroupId variable." -ForegroundColor Red
-    Write-Host "You can find the Group ID in the Azure Portal or using Graph API." -ForegroundColor Yellow
-    Write-Host "Example: `$GroupId = '12345678-1234-1234-1234-123456789012'" -ForegroundColor Yellow
-    return
-}
-
-Write-Host "Getting devices from Entra ID group: $GroupId" -ForegroundColor Yellow
-
-# Get devices in Entra ID group
-$groupUri = "https://graph.microsoft.com/v1.0/groups/$GroupId/members"
-$headers = @{
-    Authorization = "Bearer $AccessToken"
-    Accept        = "application/json"
-}
-$groupResponse = Invoke-RestMethod -Uri $groupUri -Headers $headers -Method Get
-
-foreach ($member in $groupResponse.value) {
-    if ($member.'@odata.type' -eq "#microsoft.graph.device") {
-        # Get device object ID from group member
-        $DeviceId = $member.id
-
-        # Query Graph API for device details to get displayName
-        $deviceDetailUri = "https://graph.microsoft.com/v1.0/devices/$DeviceId"
-        $deviceDetail = Invoke-RestMethod -Uri $deviceDetailUri -Headers $headers -Method Get
-
-        $OriginalDeviceName = $deviceDetail.displayName
-
+    foreach ($device in $devices) {
+        $deviceCount++
+        
         try {
-            $CountryCode = Get-DevicePrimaryUserCountryCode -OriginalDeviceName $OriginalDeviceName -AccessToken $AccessToken
-            $NewName = NewDeviceName -OriginalDeviceName $OriginalDeviceName -CountryCode $CountryCode
-            RenameDevice -OriginalDeviceName $OriginalDeviceName -NewName $NewName -AccessToken $AccessToken
-            Write-Host "Renamed '$OriginalDeviceName' to '$NewName'"
-        } catch {
-            Write-Warning "Failed to rename '$OriginalDeviceName': $_"
+            # Get device details from Entra ID
+            $deviceDetailUri = "$($Script:Config.GraphBaseUri)/v1.0/devices/$($device.id)"
+            $deviceDetail = Invoke-RestMethod -Uri $deviceDetailUri -Headers $headers -Method Get -ErrorAction Stop
+            $originalDeviceName = $deviceDetail.displayName
+
+            Write-Host "[$deviceCount/$($devices.Count)] Processing: '$originalDeviceName'" -ForegroundColor White
+            
+            # Get country code for the device's primary user
+            $countryCode = Get-DevicePrimaryUserCountryCode -DeviceName $originalDeviceName -AccessToken $accessToken
+            
+            # Generate new device name
+            $newName = New-DeviceName -OriginalDeviceName $originalDeviceName -CountryCode $countryCode
+            
+            if ($originalDeviceName -eq $newName) {
+                Write-Host "  ✓ Device already has correct name format" -ForegroundColor Green
+                $skippedCount++
+            } else {
+                # Rename the device
+                Rename-Device -OriginalDeviceName $originalDeviceName -NewName $newName -AccessToken $accessToken
+                Write-Host "  ✓ Renamed '$originalDeviceName' → '$newName'" -ForegroundColor Green
+                $successCount++
+            }
         }
+        catch {
+            Write-Host "  ✗ Failed to process '$originalDeviceName': $($_.Exception.Message)" -ForegroundColor Red
+            $failureCount++
+        }
+        
+        Write-Host ""
+    }
+
+    # Display summary
+    Write-Host "=== PROCESS SUMMARY ===" -ForegroundColor Cyan
+    Write-Host "Total devices: $deviceCount" -ForegroundColor White
+    Write-Host "Successfully renamed: $successCount" -ForegroundColor Green
+    Write-Host "Already correct: $skippedCount" -ForegroundColor Yellow
+    Write-Host "Failed: $failureCount" -ForegroundColor Red
+    
+    if ($failureCount -eq 0) {
+        Write-Host "All devices processed successfully!" -ForegroundColor Green
+        exit 0
+    } else {
+        Write-Warning "Some devices failed to process. Check the errors above."
+        exit 1
     }
 }
+catch {
+    Write-Error "Script execution failed: $($_.Exception.Message)"
+    Write-Host "Please check your configuration and try again." -ForegroundColor Yellow
+    exit 1
+}
+
+#endregion
